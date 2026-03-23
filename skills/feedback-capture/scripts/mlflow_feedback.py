@@ -115,7 +115,7 @@ def main() -> int:
 
     # Upload to Jumpbox
     print("\n[Upload] Uploading feedback to Jumpbox...")
-    upload_feedback_to_jumpbox(feedback_json_filepath, chat_history_json_filepath)
+    upload_feedback_to_jumpbox(feedback_json_filepath, chat_history_json_filepath, session_id)
 
     # Log to MLflow (only if available)
     if HAS_MLFLOW:
