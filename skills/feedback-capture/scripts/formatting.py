@@ -7,6 +7,7 @@ from utils import convert_jsonl_to_json, get_chat_history_jsonl_path
 
 def format_entry(entry_id, category, feedback, context, skill, chat_history_file):
     """Formats the feedback entry."""
+    # Date format: day-Month-year (e.g., 29-January-2026) 
     current_date = datetime.datetime.now().strftime("%d-%B-%Y")
 
     entry = (

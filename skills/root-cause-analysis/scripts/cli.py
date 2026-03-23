@@ -436,17 +436,17 @@ def cmd_status(args: argparse.Namespace, config: Config, span=None):
 
     return 0
 
-    for step in [1, 2, 3, 4, 5]:
-        filename = f"step{step}_{get_step_name(step)}.json"
-        path = analysis_dir / filename
-        if path.exists():
-            _ = load_step(analysis_dir, step)
-            size = path.stat().st_size
-            print(f"  [x] Step {step}: {filename} ({size} bytes)")
-        else:
-            print(f"  [ ] Step {step}: {filename}")
+    # for step in [1, 2, 3, 4, 5]:
+    #     filename = f"step{step}_{get_step_name(step)}.json"
+    #     path = analysis_dir / filename
+    #     if path.exists():
+    #         _ = load_step(analysis_dir, step)
+    #         size = path.stat().st_size
+    #         print(f"  [x] Step {step}: {filename} ({size} bytes)")
+    #     else:
+    #         print(f"  [ ] Step {step}: {filename}")
 
-    return 0
+    # return 0
 
 
 def _run_session_start_hook(base_dir: Path):
