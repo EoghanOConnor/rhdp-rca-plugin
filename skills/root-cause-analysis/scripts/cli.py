@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""CLI for splunk-log-analysis skill."""
+"""CLI for Root-Cause-Analysis skill."""
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -13,16 +14,22 @@ if __name__ == "__main__" and __package__ is None:
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from scripts.config import Config
     from scripts.correlator import build_correlation_timeline, fetch_correlated_logs
+    from scripts.github_fetcher import GitHubAnalyzer, GitHubClient
     from scripts.job_parser import parse_job_log
+    from scripts.jumpbox_io import upload_to_jumpbox
     from scripts.log_fetcher import fetch_job_log
-    from scripts.step4_fetch_github import GitHubClient, Step4Analyzer
+    from scripts.setup import print_checks, run_checks
+    from scripts.tracing import HAS_MLFLOW, SpanType, mlflow, trace
 else:
     # Running as module (-m scripts.cli)
     from .config import Config
     from .correlator import build_correlation_timeline, fetch_correlated_logs
+    from .github_fetcher import GitHubAnalyzer, GitHubClient
     from .job_parser import parse_job_log
+    from .jumpbox_io import upload_to_jumpbox
     from .log_fetcher import fetch_job_log
-    from .step4_fetch_github import GitHubClient, Step4Analyzer
+    from .setup import print_checks, run_checks
+    from .tracing import HAS_MLFLOW, SpanType, mlflow, trace
 
 
 def get_analysis_dir(config: Config, job_id: str) -> Path:
@@ -39,6 +46,20 @@ def save_step(analysis_dir: Path, step: int, data: dict) -> Path:
     with open(output_path, "w") as f:
         json.dump(data, f, indent=2, default=str)
     return output_path
+
+
+@trace(name="Upload analysis", span_type=SpanType.CHAIN if SpanType else None)
+def cmd_upload(args: argparse.Namespace, config: Config, span=None) -> int:
+    """Upload analysis directory to Jumpbox via jumpbox_io.upload_to_jumpbox."""
+    job_id = args.job_id
+    analysis_dir = config.analysis_dir / job_id
+    session_id = os.environ.get("CLAUDE_SESSION_ID", "unknown")
+
+    success = upload_to_jumpbox(job_id, analysis_dir, config.jumpbox_uri, session_id)
+
+    if span:
+        span.set_outputs({"job_id": job_id, "success": success})
+    return 0 if success else 1
 
 
 def get_step_name(step: int) -> str:
@@ -63,11 +84,15 @@ def load_step(analysis_dir: Path, step: int) -> dict | None:
     return None
 
 
-def cmd_analyze(args: argparse.Namespace, config: Config) -> int:
+@trace(name="Run full analysis", span_type=SpanType.CHAIN if SpanType else None)
+def cmd_analyze(args: argparse.Namespace, config: Config, span=None) -> int:
     """Run full analysis pipeline."""
     # --fetch only makes sense with --job-id, not --job-log
     if getattr(args, "fetch", False) and not args.job_id:
-        print("Error: --fetch requires --job-id (it has no effect with --job-log)")
+        error_message = "--fetch requires --job-id (it has no effect with --job-log)"
+        print(f"Error: {error_message}")
+        if span:
+            span.set_outputs({"error": error_message})
         return 1
 
     # Determine job log path - either from --job-log or by searching with --job-id
@@ -81,10 +106,16 @@ def cmd_analyze(args: argparse.Namespace, config: Config) -> int:
         elif args.fetch:
             # Auto-fetch from remote server
             if not config.remote_host or not config.remote_log_dir:
-                print("Error: --fetch requires REMOTE_HOST and REMOTE_DIR in settings")
+                error_message = "--fetch requires REMOTE_HOST and REMOTE_DIR in settings"
+                print(f"Error: {error_message}")
+                if span:
+                    span.set_outputs({"error": error_message})
                 return 1
             if not config.job_logs_dir:
-                print("Error: --fetch requires JOB_LOGS_DIR to be configured")
+                error_message = "--fetch requires JOB_LOGS_DIR to be configured"
+                print(f"Error: {error_message}")
+                if span:
+                    span.set_outputs({"error": error_message})
                 return 1
             print("[Fetch] Job log not found locally, fetching from remote...")
             try:
@@ -96,35 +127,51 @@ def cmd_analyze(args: argparse.Namespace, config: Config) -> int:
                 subprocess.CalledProcessError,
                 subprocess.TimeoutExpired,
             ) as e:
-                print(f"Error: Failed to fetch log: {e}")
+                error_message = f"Failed to fetch log: {e}"
+                print(f"Error: {error_message}")
+                if span:
+                    span.set_outputs({"error": error_message})
                 return 1
             job_log_path = config.find_job_log(args.job_id)
             if not job_log_path:
-                print(f"Error: Log fetched but not found in {config.job_logs_dir}")
+                error_message = f"Log fetched but not found in {config.job_logs_dir}"
+                print(f"Error: {error_message}")
+                if span:
+                    span.set_outputs({"error": error_message})
                 return 1
             print(f"Found job log: {job_log_path}")
         else:
             if config.job_logs_dir:
-                print(f"Error: No log file found for job {args.job_id} in {config.job_logs_dir}")
-                print("  Hint: Use --fetch to automatically download from remote server")
+                error_message = f"No log file found for job {args.job_id} in {config.job_logs_dir}. Hint: Use --fetch to automatically download from remote server"
+                print(error_message)
             else:
-                print(
-                    "Error: JOB_LOGS_DIR not configured. Set it in environment variables (.claude/settings.json) or use --job-log"
-                )
+                error_message = "JOB_LOGS_DIR not configured. Set it in environment variables (.claude/settings.json) or use --job-log"
+                print(f"Error: {error_message}")
+            if span:
+                span.set_outputs({"error": error_message})
             return 1
     else:
-        print("Error: Either --job-log or --job-id is required")
+        error_message = "Either --job-log or --job-id is required"
+        print(f"Error: {error_message}")
+        if span:
+            span.set_outputs({"error": error_message})
         return 1
 
     if not job_log_path.exists():
-        print(f"Error: Job log file not found: {job_log_path}")
+        error_message = f"Job log file not found: {job_log_path}"
+        print(f"Error: {error_message}")
+        if span:
+            span.set_outputs({"error": error_message})
         return 1
 
     # Validate Splunk config
-    errors = config.validate_splunk()
-    if errors:
-        print(f"Error: Splunk configuration invalid: {', '.join(errors)}")
-        return 1
+    splunk_errors = config.validate_splunk()
+    if splunk_errors:
+        print(f"Warning: Splunk configuration invalid: {', '.join(splunk_errors)}")
+        print(
+            "  Step 2 (Splunk log fetch) will be skipped. Set SPLUNK_HOST/SPLUNK_USERNAME/SPLUNK_PASSWORD in .claude/settings.json to enable."
+        )
+    skip_splunk = bool(splunk_errors)
 
     # GitHub token validation will be done at Step 4 (where it's actually needed)
     github_errors = config.validate_github()
@@ -155,17 +202,31 @@ def cmd_analyze(args: argparse.Namespace, config: Config) -> int:
 
     # Step 2: Fetch Splunk logs
     print("\n[Step 2] Fetching Splunk logs...")
-    try:
-        splunk_logs = fetch_correlated_logs(config, job_context)
-        step2_path = save_step(analysis_dir, 2, splunk_logs)
-        print(f"  OCP logs: {len(splunk_logs.get('ocp_logs', []))}")
-        print(f"  Error logs: {len(splunk_logs.get('error_logs', []))}")
-        print(f"  Pods found: {len(splunk_logs.get('pods_found', []))}")
-        print(f"  Output: {step2_path}")
-    except Exception as e:
-        print(f"  Error fetching Splunk logs: {e}")
-        splunk_logs = {"ocp_logs": [], "error_logs": [], "pods_found": [], "errors": [str(e)]}
+    if skip_splunk:
+        print("  Skipped: Splunk not configured")
+        splunk_logs = {
+            "ocp_logs": [],
+            "error_logs": [],
+            "pods_found": [],
+            "skipped": True,
+            "reason": "Splunk not configured",
+        }
         save_step(analysis_dir, 2, splunk_logs)
+    else:
+        try:
+            splunk_logs = fetch_correlated_logs(config, job_context)
+            step2_path = save_step(analysis_dir, 2, splunk_logs)
+            ocp_logs = splunk_logs.get("ocp_logs", [])
+            error_logs = splunk_logs.get("error_logs", [])
+            pods_found = splunk_logs.get("pods_found", [])
+            print(f"  OCP logs: {len(ocp_logs) if isinstance(ocp_logs, list) else 0}")
+            print(f"  Error logs: {len(error_logs) if isinstance(error_logs, list) else 0}")
+            print(f"  Pods found: {len(pods_found) if isinstance(pods_found, list) else 0}")
+            print(f"  Output: {step2_path}")
+        except Exception as e:
+            print(f"  Error fetching Splunk logs: {e}")
+            splunk_logs = {"ocp_logs": [], "error_logs": [], "pods_found": [], "errors": [str(e)]}
+            save_step(analysis_dir, 2, splunk_logs)
 
     # Step 3: Build correlation
     print("\n[Step 3] Building correlation timeline...")
@@ -183,7 +244,7 @@ def cmd_analyze(args: argparse.Namespace, config: Config) -> int:
     print("\n[Step 4] Fetching GitHub files...")
     step4_path = None
     if github_errors:
-        print("  Skipped: GitHub token not configured")
+        print("Skipped: GitHub token not configured")
         step4_result = {
             "job_id": job_id,
             "skipped": True,
@@ -195,13 +256,16 @@ def cmd_analyze(args: argparse.Namespace, config: Config) -> int:
     else:
         try:
             github_client = GitHubClient(config.github_token)
-            analyzer = Step4Analyzer(job_id, analysis_dir, github_client)
+            analyzer = GitHubAnalyzer(job_id, analysis_dir, github_client)
             step4_result = analyzer.run()
             step4_path = save_step(analysis_dir, 4, step4_result)
             print(f"  GitHub fetches: {len(step4_result.get('github_fetches', []))}")
             print(f"  Output: {step4_path}")
         except Exception as e:
-            print(f"  Error fetching GitHub files: {e}")
+            error_message = f"Error fetching GitHub files: {e}"
+            print(f"  {error_message}")
+            if span:
+                span.set_outputs({"error": error_message})
             return 1
 
     # Print summary
@@ -223,6 +287,16 @@ def cmd_analyze(args: argparse.Namespace, config: Config) -> int:
         print("-" * 60)
         _print_quick_summary(job_context, splunk_logs, correlation)
 
+    outputs = {
+        "job_id": job_id,
+        "status": job_context.get("status"),
+        "correlation_confidence": corr.get("confidence"),
+        "failed_tasks": len(job_context.get("failed_tasks", [])),
+        "pods_found": len(splunk_logs.get("pods_found", [])),
+        "analysis_dir": str(analysis_dir),
+    }
+    if span:
+        span.set_outputs(outputs)
     return 0
 
 
@@ -259,12 +333,16 @@ def _print_quick_summary(job_context: dict, splunk_logs: dict, correlation: dict
     print(f"\nCorrelation: {corr.get('method')} ({corr.get('confidence')} confidence)")
 
 
-def cmd_parse(args: argparse.Namespace, config: Config) -> int:
+@trace(name="Parse job log", span_type=SpanType.CHAIN if SpanType else None)
+def cmd_parse(args: argparse.Namespace, config: Config, span=None) -> int:
     """Parse job log only (Step 1)."""
     job_log_path = Path(args.job_log)
 
     if not job_log_path.exists():
-        print(f"Error: Job log file not found: {job_log_path}")
+        error_message = f"Job log file not found: {job_log_path}"
+        print(f"Error: {error_message}")
+        if span:
+            span.set_outputs({"error": error_message})
         return 1
 
     job_context = parse_job_log(job_log_path)
@@ -276,10 +354,19 @@ def cmd_parse(args: argparse.Namespace, config: Config) -> int:
     else:
         print(json.dumps(job_context, indent=2, default=str))
 
+    outputs = {
+        "job_id": job_context.get("job_id"),
+        "status": job_context.get("status"),
+        "output_file": args.output or "stdout",
+    }
+    if span:
+        span.set_outputs(outputs)
+
     return 0
 
 
-def cmd_query(args: argparse.Namespace, config: Config) -> int:
+@trace(name="Run Splunk query", span_type=SpanType.RETRIEVER if SpanType else None)
+def cmd_query(args: argparse.Namespace, config: Config, span=None) -> int:
     """Run ad-hoc Splunk query."""
     from .splunk_client import SplunkClient
 
@@ -315,12 +402,29 @@ def cmd_query(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
-def cmd_status(args: argparse.Namespace, config: Config) -> int:
+def cmd_setup(args: argparse.Namespace, config: Config, span=None) -> int:
+    """Run preflight checks for all prerequisites."""
+    base_dir = Path(__file__).parent.parent
+    repo_root = base_dir.parent.parent  # skills/ -> repo root
+    results = run_checks(base_dir, repo_root)
+
+    if getattr(args, "json", False):
+        print(json.dumps(results, indent=2))
+        return 0 if all(r["status"] == "ok" for r in results) else 1
+
+    issues = print_checks(results)
+    return 0 if issues == 0 else 1
+
+
+def cmd_status(args: argparse.Namespace, config: Config, span=None) -> int:
     """Show analysis status for a job."""
     analysis_dir = config.analysis_dir / args.job_id
 
     if not analysis_dir.exists():
-        print(f"No analysis found for job {args.job_id}")
+        error_message = f"No analysis found for job {args.job_id}"
+        print(error_message)
+        if span:
+            span.set_outputs({"error": error_message})
         return 1
 
     print(f"Analysis directory: {analysis_dir}")
@@ -330,7 +434,6 @@ def cmd_status(args: argparse.Namespace, config: Config) -> int:
         filename = f"step{step}_{get_step_name(step)}.json"
         path = analysis_dir / filename
         if path.exists():
-            _ = load_step(analysis_dir, step)
             size = path.stat().st_size
             print(f"  [x] Step {step}: {filename} ({size} bytes)")
         else:
@@ -339,7 +442,27 @@ def cmd_status(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
-def main():
+def _run_mlflow_autolog(base_dir: Path):
+    """Run MLflow autolog setup."""
+    try:
+        tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+        experiment_name = os.environ.get("MLFLOW_EXPERIMENT_NAME", "Default")
+
+        result = subprocess.run(
+            ["mlflow", "autolog", "claude", "-u", tracking_uri, "-n", experiment_name],
+            cwd=str(base_dir),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout:
+            print(f"\n{result.stdout.strip()}")
+    except Exception:
+        pass
+
+
+@trace(name="root-cause-analysis", span_type=SpanType.TOOL if SpanType else None)
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Splunk Log Analysis - Correlate AAP job logs with Splunk OCP logs"
     )
@@ -372,25 +495,55 @@ def main():
     )
     query_parser.add_argument("--output", "-o", help="Output file (default: print summary)")
 
+    # setup command
+    setup_parser = subparsers.add_parser("setup", help="Check prerequisites and configuration")
+    setup_parser.add_argument("--json", action="store_true", help="Output results as JSON")
+
     # status command
     status_parser = subparsers.add_parser("status", help="Show analysis status")
     status_parser.add_argument("job_id", help="Job ID to check")
+
+    # upload command
+    upload_parser = subparsers.add_parser("upload", help="Upload analysis to Jumpbox")
+    upload_parser.add_argument("--job-id", required=True, help="Job ID to upload")
 
     args = parser.parse_args()
 
     # Load config
     base_dir = Path(__file__).parent.parent
     config = Config.from_env(base_dir)
-
+    span = None
+    if HAS_MLFLOW:
+        mlflow.update_current_trace(
+            metadata={
+                "mlflow.trace.session": f"{os.environ.get('CLAUDE_SESSION_ID')}",
+                "mlflow.trace.user": os.environ.get("MLFLOW_TAG_USER"),
+                "mlflow.source.name": "root-cause-analysis",
+            },
+        )
+        span = mlflow.get_current_active_span()
+        if span:
+            span.set_inputs(
+                {
+                    "request": f"root-cause-analysis {args.command} {args} ",
+                    "job_id": str(getattr(args, "job_id", None)),
+                    "job_log": str(getattr(args, "job_log", None)),
+                    "command": args.command,
+                }
+            )
     # Dispatch command
     commands = {
         "analyze": cmd_analyze,
         "parse": cmd_parse,
         "query": cmd_query,
+        "setup": cmd_setup,
         "status": cmd_status,
+        "upload": cmd_upload,
     }
 
-    return commands[args.command](args, config)
+    exit_code = commands[args.command](args, config, span)
+    _run_mlflow_autolog(base_dir)
+    return exit_code
 
 
 if __name__ == "__main__":

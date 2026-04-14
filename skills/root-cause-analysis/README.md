@@ -123,10 +123,10 @@ Required GitHub MCP tools:
 # Step 5: Claude analyzes the data and generates summary (automatic when skill is invoked)
 ```
 
-**Note**: The `cli.py analyze` command runs all steps (1-4) automatically. Step 4 can also be run separately if needed:
+**Note**: The `cli.py analyze` command runs all steps (1-4) automatically. The GitHub fetcher can also be run separately if needed:
 ```bash
-# Run step 4 separately (standalone execution)
-.venv/bin/python scripts/step4_fetch_github.py --job-id 1234567
+# Run GitHub fetcher separately (standalone execution)
+.venv/bin/python scripts/github_fetcher.py --job-id 1234567
 ```
 
 ### Analyze by Job ID
@@ -170,6 +170,24 @@ Alternatively, specify the log file directly:
 .venv/bin/python scripts/cli.py status 1234567
 ```
 
+### MLflow Tracing (optional)
+
+MLflow tracing is supported for debugging and performance analysis but is **not required**. All analysis commands work without MLflow installed.
+
+To enable tracing:
+1. Install MLflow: `pip install "mlflow[genai]>=3.4"` (or `pip install -e ".[mlflow]"` from the repo root)
+2. Configure `MLFLOW_PORT`, `MLFLOW_EXPERIMENT_NAME`, and optionally `JUMPBOX_URI` in `.claude/settings.json`
+3. Add the required MLflow hooks to `.claude/settings.json`:
+   ```json
+   "hooks": {
+     "Stop": [{ "hooks": [{ "type": "command", "command": "python -c \"from mlflow.claude_code.hooks import stop_hook_handler; stop_hook_handler()\"" }] }],
+     "SessionStart": [{ "hooks": [{ "type": "command", "command": "INPUT=$(cat); SESSION_ID=$(echo \"$INPUT\" | jq -r '.session_id'); echo \"export CLAUDE_SESSION_ID='$SESSION_ID'\" >> \"$CLAUDE_ENV_FILE\"" }] }]
+   }
+   ```
+   The `Stop` hook flushes traces and the `SessionStart` hook captures the session ID for correlation.
+
+When enabled, pipeline-level traces (analysis steps 1-4) appear in the MLflow UI. When not installed, tracing is silently skipped.
+
 ## How It Works
 
 ### Steps 1-4: Automated Analysis (Python Scripts)
@@ -200,7 +218,7 @@ All steps are executed automatically by the `cli.py analyze` command:
 - Reports success/404 status for each file attempt
 - Output: `step4_github_fetch_history.json`
 
-**Post-Step4 GitHub MCP Verification**: If step4 output contains `"error": "all_paths_failed"` or any `"status": "404"` in `paths_tried` arrays, **MUST** verify 404 errors using MCP tools. See [post-step4-verification.md](post-step4-verification.md) for complete verification process.
+**GitHub MCP Verification**: If step4 output contains `"error": "all_paths_failed"` or any `"status": "404"` in `paths_tried` arrays, verify 404 errors using MCP tools. See [github_mcp_verification.md](github_mcp_verification.md) for complete verification process.
 
 ### Step 5: Analyze and Generate Summary (Claude)
 
@@ -225,6 +243,11 @@ All steps are executed automatically by the `cli.py analyze` command:
 **Note**: Job details, failed tasks, and configuration data are available in step1 and step4 files - reference them rather than duplicating in the summary.
 
 **Output**: `step5_analysis_summary.json` (or present directly to user)
+
+**Post-Step 5 Action**: After saving the summary, run the upload command to send the analysis to the Jumpbox:
+```bash
+python scripts/cli.py upload --job-id <job-id>
+```
 
 ## Output
 
@@ -288,8 +311,8 @@ The skill can read job logs in these formats:
 - **Note**: MCP tools are only used for 404 verification, not for fetching files
 
 ### Files Not Found (404 errors)
-- Step 4 script handles path variations automatically
-- If 404 errors occur, use GitHub MCP tools to verify (see Step 4 section above)
+- GitHub fetcher script handles path variations automatically
+- If 404 errors occur, use GitHub MCP tools to verify (see GitHub MCP Verification section above)
 - Check parent directories first before doing wild searches
 - Document findings to identify parser bugs vs truly missing files
 

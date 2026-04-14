@@ -18,12 +18,91 @@ Investigate failed jobs by correlating Ansible Automation Platform (AAP) job log
 When a user asks to analyze a failed job, execute these steps automatically.
 The skill's base path is provided when this skill is invoked. Run scripts relative to this folder.
 
-### Setup (run once per session if .venv doesn't exist)
+### Preflight Check (run before first analysis)
 
 ```bash
-# Create virtual environment and install dependencies
+# Create virtual environment and install dependencies (if .venv doesn't exist)
 python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt
+
+# Check all prerequisites (use --json for structured output)
+.venv/bin/python scripts/cli.py setup --json
 ```
+
+Review the JSON output. Some settings are required, others are optional:
+
+**Required** (skill will not proceed without these):
+- **JOB_LOGS_DIR** -- Local directory for job log files
+- **JUMPBOX_URI** -- SSH jumpbox connection for uploading analysis results and feedback
+
+**Recommended** (analysis works without these but functionality is reduced):
+- **MLFlow** -- Tracing configuration for recording analysis runs (MLFLOW_PORT, MLFLOW_EXPERIMENT_NAME, MLFLOW_TAG_USER)
+
+**Optional** (skill runs with reduced functionality when missing):
+- **SSH / REMOTE_HOST** not configured: `--fetch` flag won't work (user must provide logs in JOB_LOGS_DIR manually)
+- **Splunk** not configured: Steps 2-3 (log correlation) will be skipped
+- **GitHub token** not configured: Step 4 (config fetching) will be skipped
+
+#### Interactive Setup for Missing Configs
+
+If any checks have `"status": "missing"` and `"configurable": true`, offer to help the user configure them:
+
+1. List the missing configurable items grouped by check name
+2. Ask: "Would you like me to help configure these? I'll walk you through each one."
+3. If yes, for each missing check with `"configurable": true`:
+   - Show the check name and each `env_vars[].prompt` to explain what's needed
+   - If the env var has a `"default"`, mention it (user can press enter to accept)
+   - If the env var has `"optional": true`, let the user know they can skip it
+   - Ask the user for the value
+   - **SSH special handling**: If the SSH check has `"ssh_setup_needed": true`:
+     - Ask the user for their SSH host alias name
+     - Check if that alias already exists in `~/.ssh/config` -- if so, use it as `REMOTE_HOST`
+     - If it doesn't exist, ask: do you want to create a new SSH config entry? If yes, ask for: hostname, username, port (default 22), and optional identity file path
+     - Read `~/.ssh/config`, append the new `Host` block, and write it back
+     - Then set `REMOTE_HOST` to the alias name
+4. After collecting all values, read the project's `.claude/settings.json` file
+5. Merge the new values into the `"env"` block (create it if it doesn't exist)
+6. If MLflow env vars were configured (MLFLOW_PORT, MLFLOW_EXPERIMENT_NAME), also add the required MLflow hooks to the `"hooks"` block (create it if it doesn't exist):
+   ```json
+   "hooks": {
+     "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); SESSION_ID=$(echo \"$INPUT\" | jq -r '.session_id'); echo \"export CLAUDE_SESSION_ID='$SESSION_ID'\" >> \"$CLAUDE_ENV_FILE\""
+          },
+          {
+            "type": "command",
+            "command": "if ! lsof -iTCP:$MLFLOW_PORT -sTCP:LISTEN >/dev/null 2>&1; then ssh -f -N -o ExitOnForwardFailure=yes -L $MLFLOW_PORT:localhost:5000 $JUMPBOX_URI; fi"
+          },
+          {
+            "type": "command",
+            "command": "if [ \"$MLFLOW_CLAUDE_TRACING_ENABLED\" = \"true\" ]; then if ! pip show mlflow >/dev/null 2>&1; then pip install mlflow; fi; fi"
+          },
+          {
+            "type": "command",
+            "command": "if [ \"$MLFLOW_CLAUDE_TRACING_ENABLED\" = \"true\" ]; then python3 -c \"import mlflow; client=mlflow.tracking.MlflowClient(tracking_uri='http://127.0.0.1:$MLFLOW_PORT'); exp=client.get_experiment_by_name('$MLFLOW_EXPERIMENT_NAME'); client.restore_experiment(exp.experiment_id) if exp and exp.lifecycle_stage == 'deleted' else None\" && mlflow autolog claude -u http://127.0.0.1:$MLFLOW_PORT -n $MLFLOW_EXPERIMENT_NAME; fi"
+          }
+        ]
+      }
+    ],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "python -c \"from mlflow.claude_code.hooks import stop_hook_handler; stop_hook_handler()\"" }] }],
+   }
+   ```
+7. Write the updated settings file
+8. Tell the user to **restart the Claude Code session** for env vars and hooks to take effect
+9. **Important**: Write secrets (tokens, passwords) to `.claude/settings.json` -- ensure this file is in `.gitignore`
+
+If checks show non-configurable errors (e.g., venv issues, rsync not found), provide the fix command instead.
+
+#### MLFlow Server Startup
+
+The `MLFlow server` preflight check automatically handles server connectivity:
+- If the server is unreachable and `JUMPBOX_URI` is configured, it starts an SSH tunnel automatically
+- If the tunnel is already running, it skips startup
+- If the tunnel fails, it reports the error but the skill can still proceed (MLFlow is recommended, not required)
+
+If any **required** checks (JOB_LOGS_DIR, JUMPBOX_URI) are still missing after the setup flow, do **not** proceed to analysis -- tell the user what's still needed. If MLFlow is missing, warn that tracing won't be recorded but proceed. If all required checks pass (recommended/optional items may remain missing), proceed to analysis.
 
 ### Step 1-4: Run the analysis CLI
 
@@ -67,7 +146,7 @@ python3 -m venv .venv
 
 ---
 
-**Post-Step4 GitHub MCP Verification**: If step4 output contains `"error": "all_paths_failed"` or any error status (e.g., `"status": "404"`, `"status": "timeout"`, `"status": "500"`) in `paths_tried` arrays, reasoning errors using MCP tools. See [post-step4-verification.md](post-step4-verification.md) for complete verification process.
+**GitHub MCP Verification**: If step4 output contains `"error": "all_paths_failed"` or any error status (e.g., `"status": "404"`, `"status": "timeout"`, `"status": "500"`) in `paths_tried` arrays, reasoning errors using MCP tools. See [github_mcp_verification.md](github_mcp_verification.md) for complete verification process.
 
 ---
 
@@ -80,6 +159,11 @@ python3 -m venv .venv
 4. **CONDITIONAL**: `step2_splunk_logs.json` - Only read if step3 indicates errors needing deeper investigation
 
 **Output**: `.analysis/<job-id>/step5_analysis_summary.json` 
+
+**Post-Step 5 Action**: After saving the summary, you MUST run the upload command to send the analysis to the Jumpbox:
+```bash
+python scripts/cli.py upload --job-id <job-id>
+```
 
 ### Analysis Guidelines
 

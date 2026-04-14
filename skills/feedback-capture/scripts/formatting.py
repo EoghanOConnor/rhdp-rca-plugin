@@ -1,31 +1,30 @@
 import argparse
 import datetime
+import json
 import os
-import uuid
+from pathlib import Path
 
-from utils import convert_jsonl_to_json, get_chat_history_jsonl_path
-
-
-def generate_unique_id():
-    """Generates a unique identifier."""
-    return str(uuid.uuid4())
+from utils import convert_jsonl_to_json, get_chat_history_jsonl_path, upload_feedback_to_jumpbox
 
 
 def format_entry(entry_id, category, feedback, context, skill, chat_history_file):
-    """Formats the feedback entry."""
-    # Date format: day-Month-year (e.g., 29-January-2026)
+    """Formats the feedback entry as a dictionary."""
     current_date = datetime.datetime.now().strftime("%d-%B-%Y")
+    timestamp = datetime.datetime.now().isoformat()
 
-    entry = (
-        f"ID: {entry_id}\n"
-        f"Category: {category}\n"
-        f"Date: {current_date}\n"
-        f"Skill: {skill}\n"
-        f"Feedback: {feedback}\n"
-        f"Context: {context}\n"
-        f"Chat History File: {chat_history_file}\n"
-        "\n"  # Add a newline separator between entries
-    )
+    entry = {
+        "id": entry_id,
+        "category": category,
+        "date": current_date,
+        "timestamp": timestamp,
+        "skill": skill,
+        "feedback": feedback,
+        "context": context,
+        "summary": context,  # MLflow uses "summary" field
+        "chat_history_file": chat_history_file,
+        "user": os.environ.get("MLFLOW_TAG_USER", os.environ.get("USER", "unknown")),
+        "source": "feedback-capture",
+    }
     return entry
 
 
@@ -38,38 +37,30 @@ def main():
 
     args = parser.parse_args()
 
-    # Start the conversation with the user
-    # Get session ID from environment variable (set by session-start hook)
     session_id = os.environ.get("CLAUDE_SESSION_ID")
     if session_id:
         print(f"Session ID: {session_id}")
     else:
         print("Warning: CLAUDE_SESSION_ID not found in environment")
-    # Chat history directory (relative to this script)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    chat_history_dir = os.path.join(script_dir, "chat_history")
 
-    # Feedback file is in the script directory
-    feedback_file = os.path.join(script_dir, "feedback.txt")
-    # Create directory if it doesn't exist
-    os.makedirs(chat_history_dir, exist_ok=True)
+    script_dir = Path(__file__).parent
+    chat_history_dir = script_dir / "chat_history"
+    chat_history_dir.mkdir(exist_ok=True)
+
+    # Single feedback.json file that contains all feedback entries
+    feedback_json_filepath = script_dir / "feedback.json"
 
     chat_history_json_filename = f"chat_history_{session_id}.json"
-    chat_history_json_filepath = os.path.join(chat_history_dir, chat_history_json_filename)
+    chat_history_json_filepath = chat_history_dir / chat_history_json_filename
 
-    # Gets latest session file
     history_jsonl_path = get_chat_history_jsonl_path(session_id)
     if history_jsonl_path:
         print(f"Jsonl file: {history_jsonl_path}")
-
-        # Read JSONL into memory (list of dicts) AND save JSON
         convert_jsonl_to_json(history_jsonl_path, chat_history_json_filepath)
-
     else:
         print("No Claude session file found to auto-detect")
 
-    # We save the TXT filename in the feedback entry as it's the readable one,
-    # but both exist.
+    # Create feedback entry as dictionary
     formatted_entry = format_entry(
         session_id,
         args.category,
@@ -79,12 +70,43 @@ def main():
         chat_history_json_filename,
     )
 
+    # Load existing feedback entries or create new list
+    feedback_entries = []
+    if feedback_json_filepath.exists():
+        try:
+            with open(feedback_json_filepath) as f:
+                feedback_entries = json.load(f)
+                if not isinstance(feedback_entries, list):
+                    feedback_entries = []
+        except Exception as e:
+            print(f"Warning: Could not read existing feedback.json: {e}")
+            feedback_entries = []
+
+    # Append new entry
+    feedback_entries.append(formatted_entry)
+
+    # Save updated feedback.json
     try:
-        with open(feedback_file, "a") as f:
-            f.write(formatted_entry)
-        print(f"Successfully saved Entry {session_id} to {feedback_file}")
+        with open(feedback_json_filepath, "w") as f:
+            json.dump(feedback_entries, f, indent=2)
+        print(f"Successfully saved feedback {session_id} to {feedback_json_filepath}")
     except Exception as e:
         print(f"Error writing to file: {e}")
+
+    # Upload to Jumpbox
+    print("\n[Upload] Uploading feedback to Jumpbox...")
+    upload_feedback_to_jumpbox(feedback_json_filepath, chat_history_json_filepath, session_id)
+
+    # Also log to MLflow if available
+    try:
+        from mlflow_feedback import log_feedback
+
+        log_feedback(args.category, args.feedback, args.context, args.skill)
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"MLflow logging skipped: {e}")
+
     print(f"Chat history file is {chat_history_json_filepath}")
 
 
